@@ -73,13 +73,14 @@ def t(s):
 
 
 def http_get(url, timeout=12):
-    """GET 请求，5xx/超时返回 None"""
+    """GET 请求，非200/超时返回 None"""
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         if r.status_code == 200:
             return r
-    except Exception:
-        pass
+        print(f"  [WARN] {url[:60]} → HTTP {r.status_code}")
+    except Exception as e:
+        print(f"  [WARN] {url[:60]} → {str(e)[:80]}")
     return None
 
 
@@ -91,12 +92,22 @@ def http_json(url, timeout=12):
 # ── 1. 市场数据 ────────────────────────────────────────
 
 def fetch_binance_prices():
-    """Binance 公开 REST API — 主流币价格 + 涨跌幅"""
-    try:
-        tickers = http_json("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
-        if not tickers:
-            return []
-        # 建立 USDT 交易对索引
+    """主流币价格 — 多 Binance 端点自动切换 + CoinGecko 兜底"""
+    # 尝试多个 Binance 端点
+    endpoints = [
+        "https://api.binance.com/api/v3/ticker/24hr",
+        "https://api1.binance.com/api/v3/ticker/24hr",
+        "https://api2.binance.com/api/v3/ticker/24hr",
+        "https://api3.binance.com/api/v3/ticker/24hr",
+    ]
+    tickers = None
+    for url in endpoints:
+        data = http_json(url, timeout=15)
+        if data and isinstance(data, list) and len(data) > 100:
+            tickers = data
+            break
+
+    if tickers:
         idx = {t["symbol"]: t for t in tickers if t["symbol"].endswith("USDT")}
         rows = []
         for coin in COINS:
@@ -109,10 +120,30 @@ def fetch_binance_prices():
             rows.append({"coin": coin, "price": price, "chg_24h": chg,
                          "volume": vol, "high": float(tkr["highPrice"]),
                          "low": float(tkr["lowPrice"])})
+        if rows:
+            return rows
+
+    # CoinGecko 兜底
+    print("  Binance 全部失败，回退 CoinGecko 价格...")
+    cg_map = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+              "SUI": "sui", "DOGE": "dogecoin", "LINK": "chainlink"}
+    cg = http_json(
+        f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(cg_map.values())}"
+        f"&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true",
+        timeout=20
+    )
+    if cg:
+        rows = []
+        for coin, cg_id in cg_map.items():
+            d = cg.get(cg_id, {})
+            if not d:
+                continue
+            rows.append({"coin": coin, "price": d.get("usd", 0),
+                         "chg_24h": d.get("usd_24h_change", 0) or 0,
+                         "volume": d.get("usd_24h_vol", 0) or 0,
+                         "high": 0, "low": 0})
         return rows
-    except Exception as e:
-        print(f"  [ERR] Binance: {e}")
-        return []
+    return []
 
 
 def fetch_fear_greed():
@@ -140,25 +171,44 @@ def fetch_global_market():
 # ── 2. 币圈快讯 (CryptoPanic) ──────────────────────────
 
 def fetch_crypto_news():
-    """CryptoPanic 聚合新闻（含KOL推文）"""
+    """币圈快讯 — CryptoPanic + Binance 公告兜底"""
     items = []
-    try:
-        data = http_json(
-            "https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&limit=10",
-            timeout=15
-        )
-        if not data:
-            return items
-        for p in data.get("results", [])[:8]:
+    # CryptoPanic
+    data = http_json(
+        "https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&limit=8",
+        timeout=15
+    )
+    if data:
+        for p in data.get("results", [])[:6]:
             title = p.get("title", "")
+            domain = p.get("domain", "")
             items.append({
                 "title": t(title),
                 "url": p.get("url", ""),
-                "source": p.get("source", {}).get("title", ""),
+                "source": p.get("source", {}).get("title", "") or domain,
                 "published": p.get("published_at", "")[:10],
             })
-    except Exception as e:
-        print(f"  [ERR] CryptoPanic: {e}")
+    if items:
+        return items
+
+    # 兜底: Binance 公告
+    print("  CryptoPanic 失败，回退 Binance 公告...")
+    try:
+        r = requests.get(
+            "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+            "?type=1&catalogId=48&pageNo=1&pageSize=6",
+            headers=HEADERS, timeout=15
+        )
+        if r.status_code == 200:
+            catalogs = r.json().get("data", {}).get("catalogs", [])
+            for cat in catalogs:
+                for art in cat.get("articles", [])[:6]:
+                    title = art.get("title", "")
+                    if title:
+                        items.append({"title": t(title), "url": "", "source": "Binance"})
+            return items[:6]
+    except Exception:
+        pass
     return items
 
 
@@ -228,22 +278,28 @@ def fetch_kol_tweets():
 # ── 4. 一级市场 ────────────────────────────────────────
 
 def fetch_dex_new():
-    """DexScreener 最新代币 — 只保留有正常名称的"""
+    """DexScreener 最新代币 — 过滤垃圾"""
     data = http_json("https://api.dexscreener.com/token-profiles/latest/v1", timeout=15)
     if not data:
         return []
     items = []
-    for p in data[:15]:
-        name = p.get("name", "")
-        addr = p.get("tokenAddress", "")
-        # 过滤：只要名字不是地址格式的
-        if len(name) > 30 or re.match(r"^[0-9A-Za-z]{30,}$", name or ""):
-            name = addr[:8] + "..." if addr else "?"
+    for p in data[:20]:
+        name = p.get("name") or ""
+        addr = p.get("tokenAddress", "") or ""
+        chain = (p.get("chainId") or "?").upper()
         desc = (p.get("description") or "")[:60]
-        chain = p.get("chainId", "?").upper()
-        items.append({"name": name[:24], "chain": chain, "desc": desc,
-                      "url": p.get("url", "")})
-        if len(items) >= 6:
+
+        # 名字为空或纯地址格式 → 取前8位
+        if not name or re.match(r"^[0-9A-Za-z]{30,}$", name):
+            name = addr[:10] + "..." if addr else "?"
+
+        # 跳过没有URL的
+        url = p.get("url", "")
+        if not url:
+            continue
+
+        items.append({"name": name[:24], "chain": chain, "desc": desc, "url": url})
+        if len(items) >= 5:
             break
     return items
 
@@ -261,20 +317,35 @@ def fetch_trending():
 # ── 5. 社区热议 (Reddit) ────────────────────────────────
 
 def fetch_reddit():
-    """r/CryptoCurrency 热帖"""
-    data = http_json("https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5", timeout=12)
-    if not data:
-        return []
-    items = []
-    for post in data.get("data", {}).get("children", [])[:5]:
-        d = post["data"]
-        items.append({
-            "title": d.get("title", ""),
-            "score": d.get("score", 0),
-            "comments": d.get("num_comments", 0),
-            "url": f"https://reddit.com{d.get('permalink', '')}",
-        })
-    return items
+    """r/CryptoCurrency 热帖 — 多 User-Agent 重试"""
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "DailyBriefing/2.0 (Newsletter Bot)",
+    ]
+    for ua in uas:
+        try:
+            h = {**HEADERS, "User-Agent": ua}
+            r = requests.get(
+                "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5&raw_json=1",
+                headers=h, timeout=12
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            items = []
+            for post in data.get("data", {}).get("children", [])[:5]:
+                d = post["data"]
+                items.append({
+                    "title": d.get("title", ""),
+                    "score": d.get("score", 0),
+                    "comments": d.get("num_comments", 0),
+                    "url": f"https://reddit.com{d.get('permalink', '')}",
+                })
+            if items:
+                return items
+        except Exception:
+            continue
+    return []
 
 
 # ── 6. AI 前沿 ──────────────────────────────────────────
