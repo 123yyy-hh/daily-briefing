@@ -1,127 +1,382 @@
 """
-每日简报 — 币圈资讯 + AI前沿
-GitHub Actions 定时执行 (UTC 1:00 = 北京时间 9:00)
-发送 HTML 邮件到 QQ 邮箱
+每日简报 v2 — 币圈资讯 + AI前沿 + X KOL观点
+GitHub Actions 定时 (UTC 1:00 = 北京时间 9:00) → QQ邮箱 HTML
 """
-import os
-import sys
-import json
-import time
-import smtplib
+import os, sys, json, time, smtplib, re, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import ccxt
 
-# ── 路径 & 配置 ─────────────────────────────────────────
+# ── 配置 ────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 PARENT_CONFIG = os.path.join(os.path.dirname(BASE), "config.json")
+HEADERS = {"User-Agent": "Mozilla/5.0 DailyBriefing/2.0"}
 
-COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "SUI/USDT", "DOGE/USDT", "LINK/USDT"]
-FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
-COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
-COINGECKO_TRENDING = "https://api.coingecko.com/api/v3/search/trending"
-COINGECKO_CATEGORIES = "https://api.coingecko.com/api/v3/coins/categories"
-DEX_LATEST = "https://api.dexscreener.com/token-profiles/latest/v1"
-CRYPTOPANIC_NEWS = "https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&limit=8"
-REDDIT_CRYPTO = "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5"
-HN_TOP = "https://hacker-news.firebaseio.com/v0/topstories.json"
-HN_ITEM = "https://hacker-news.firebaseio.com/v0/item/{}.json"
-ARXIV_API = "http://export.arxiv.org/api/query"
-GITHUB_AI = "https://api.github.com/search/repositories"
+# X 上值得关注的币圈 KOL (用户名)
+KOL_LIST = [
+    "cz_binance", "VitalikButerin", "saylor", "cobie",
+    "0xKawz", "loomdart", "CryptoCapo_", "CryptoPoseidonn",
+    "BiteyOfBitey", "0xcryptowizard",
+]
+
+# Nitter 实例（多备选，自动切换）
+NITTER_INSTANCES = [
+    "https://nitter.poast.org",
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+]
 
 AI_KEYWORDS = [
     "AI", "GPT", "LLM", "OpenAI", "Claude", "Gemini", "DeepSeek", "Llama",
     "machine learning", "diffusion", "transformer", "agent", "AGI",
-    "neural", "NLP", "vision", "robot", "embedding", "RAG", "fine-tune",
+    "neural", "NLP", "vision", "robot", "RAG", "fine-tune",
     "artificial intelligence", "deep learning", "generative", "copilot",
     "mistral", "anthropic", "stable diffusion", "midjourney",
 ]
 
-HEADERS = {"User-Agent": "DailyBriefing/1.0 (Crypto+AI Newsletter Bot)"}
+COINS = ["BTC", "ETH", "SOL", "SUI", "DOGE", "LINK"]
 
 
-# ── 配置读取 ────────────────────────────────────────────
+# ── 工具 ────────────────────────────────────────────────
 def get_config():
-    """优先环境变量(GitHub Secrets)，回退 config.json"""
     cfg = {
-        "email_to": os.environ.get("EMAIL_TO", ""),
-        "email_smtp_user": os.environ.get("EMAIL_SMTP_USER", ""),
-        "email_smtp_pass": os.environ.get("EMAIL_SMTP_PASS", ""),
-        "proxy": os.environ.get("PROXY", ""),
+        "to": os.environ.get("EMAIL_TO", ""),
+        "user": os.environ.get("EMAIL_SMTP_USER", ""),
+        "pass": os.environ.get("EMAIL_SMTP_PASS", ""),
     }
-    # 如果环境变量没配，尝试 config.json
-    if not cfg["email_smtp_pass"] and os.path.exists(PARENT_CONFIG):
+    if not cfg["pass"] and os.path.exists(PARENT_CONFIG):
         try:
             with open(PARENT_CONFIG, "r") as f:
                 j = json.load(f)
-            cfg["email_to"] = cfg["email_to"] or j.get("email_to", "")
-            cfg["email_smtp_user"] = cfg["email_smtp_user"] or j.get("email_smtp_user", "")
-            cfg["email_smtp_pass"] = cfg["email_smtp_pass"] or j.get("email_smtp_pass", "")
-            cfg["proxy"] = cfg["proxy"] or j.get("proxy", "")
+            cfg["to"] = cfg["to"] or j.get("email_to", "")
+            cfg["user"] = cfg["user"] or j.get("email_smtp_user", "")
+            cfg["pass"] = cfg["pass"] or j.get("email_smtp_pass", "")
         except Exception:
             pass
     return cfg
 
 
-def get_proxies():
-    cfg = get_config()
-    p = cfg.get("proxy", "")
-    if p:
-        return {"http": p, "https": p}
+def t(s):
+    """翻译 EN→CN，已有中文则跳过"""
+    if not s or any("一" <= c <= "鿿" for c in str(s)):
+        return s
+    try:
+        r = requests.get("https://translate.googleapis.com/translate_a/single",
+                         params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": s},
+                         timeout=8)
+        return "".join([x[0] for x in r.json()[0] if x[0]])
+    except Exception:
+        return s
+
+
+def http_get(url, timeout=12):
+    """GET 请求，5xx/超时返回 None"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r
+    except Exception:
+        pass
     return None
 
 
-def get_public_exchange():
-    """Binance 公网连接"""
-    ex = ccxt.binance({"enableRateLimit": True, "timeout": 15000})
-    proxies = get_proxies()
-    if proxies:
-        ex.session.proxies = proxies
-    return ex
+def http_json(url, timeout=12):
+    r = http_get(url, timeout)
+    return r.json() if r else None
 
 
-# ── 工具函数 ────────────────────────────────────────────
-def translate(text):
-    """Google 翻译：英文→中文"""
-    if not text or any("一" <= c <= "鿿" for c in text):
-        return text  # 已有中文，跳过
+# ── 1. 市场数据 ────────────────────────────────────────
+
+def fetch_binance_prices():
+    """Binance 公开 REST API — 主流币价格 + 涨跌幅"""
     try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        r = requests.get(url, params={
-            "client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text
-        }, timeout=8)
-        parts = r.json()[0]
-        return "".join([s[0] for s in parts if s[0]])
+        tickers = http_json("https://api.binance.com/api/v3/ticker/24hr", timeout=15)
+        if not tickers:
+            return []
+        # 建立 USDT 交易对索引
+        idx = {t["symbol"]: t for t in tickers if t["symbol"].endswith("USDT")}
+        rows = []
+        for coin in COINS:
+            tkr = idx.get(f"{coin}USDT")
+            if not tkr:
+                continue
+            price = float(tkr["lastPrice"])
+            chg = float(tkr.get("priceChangePercent", 0))
+            vol = float(tkr.get("quoteVolume", 0))
+            rows.append({"coin": coin, "price": price, "chg_24h": chg,
+                         "volume": vol, "high": float(tkr["highPrice"]),
+                         "low": float(tkr["lowPrice"])})
+        return rows
+    except Exception as e:
+        print(f"  [ERR] Binance: {e}")
+        return []
+
+
+def fetch_fear_greed():
+    data = http_json("https://api.alternative.me/fng/?limit=1")
+    if data:
+        d = data["data"][0]
+        return {"value": int(d["value"]), "label": d["value_classification"]}
+    return None
+
+
+def fetch_global_market():
+    data = http_json("https://api.coingecko.com/api/v3/global")
+    if data:
+        d = data["data"]
+        return {
+            "mcap": d["total_market_cap"]["usd"],
+            "vol": d.get("total_volume", {}).get("usd", 0),
+            "btc_dom": d["market_cap_percentage"]["btc"],
+            "eth_dom": d["market_cap_percentage"]["eth"],
+            "chg": d.get("market_cap_change_percentage_24h_usd", 0),
+        }
+    return None
+
+
+# ── 2. 币圈快讯 (CryptoPanic) ──────────────────────────
+
+def fetch_crypto_news():
+    """CryptoPanic 聚合新闻（含KOL推文）"""
+    items = []
+    try:
+        data = http_json(
+            "https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&limit=10",
+            timeout=15
+        )
+        if not data:
+            return items
+        for p in data.get("results", [])[:8]:
+            title = p.get("title", "")
+            items.append({
+                "title": t(title),
+                "url": p.get("url", ""),
+                "source": p.get("source", {}).get("title", ""),
+                "published": p.get("published_at", "")[:10],
+            })
+    except Exception as e:
+        print(f"  [ERR] CryptoPanic: {e}")
+    return items
+
+
+# ── 3. X KOL 发帖 (Nitter RSS) ─────────────────────────
+
+def _nitter_fetch(instance, username, timeout=10):
+    """从单个 Nitter 实例拉 RSS"""
+    url = f"{instance}/{username}/rss"
+    r = http_get(url, timeout=timeout)
+    if not r:
+        return []
+    try:
+        root = ET.fromstring(r.text)
+        # RSS 2.0: channel > item
+        items = []
+        for item in root.findall(".//item")[:3]:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            date_el = item.find("pubDate")
+            items.append({
+                "title": (title_el.text or "").strip() if title_el is not None else "",
+                "url": (link_el.text or "").strip() if link_el is not None else "",
+                "date": (date_el.text or "")[:16] if date_el is not None else "",
+            })
+        return items
     except Exception:
-        return text
+        return []
 
 
-def fetch_json(url, timeout=15, proxies=None):
-    """带超时和代理的 GET JSON，代理不可用时自动回退直连"""
-    if proxies:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout, proxies=proxies)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            pass  # 代理失败，回退直连
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def fetch_kol_tweets():
+    """多线程拉取 KOL 最新推文，Nitter 实例自动切换"""
+    all_tweets = []
+
+    def fetch_one(username):
+        for inst in NITTER_INSTANCES:
+            items = _nitter_fetch(inst, username, timeout=8)
+            if items:
+                return [(username, items)]
+            time.sleep(0.5)
+        return []
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(fetch_one, u): u for u in KOL_LIST}
+        for f in as_completed(futures, timeout=45):
+            try:
+                result = f.result()
+                all_tweets.extend(result)
+            except Exception:
+                pass
+
+    # 按时间排序取最新 8 条
+    flat = []
+    for username, items in all_tweets:
+        for item in items:
+            flat.append({**item, "author": username, "handle": f"@{username}"})
+
+    # 简单去重（按 URL）
+    seen = set()
+    unique = []
+    for tw in sorted(flat, key=lambda x: x.get("date", ""), reverse=True):
+        if tw["url"] not in seen:
+            seen.add(tw["url"])
+            unique.append(tw)
+    return unique[:8]
+
+
+# ── 4. 一级市场 ────────────────────────────────────────
+
+def fetch_dex_new():
+    """DexScreener 最新代币 — 只保留有正常名称的"""
+    data = http_json("https://api.dexscreener.com/token-profiles/latest/v1", timeout=15)
+    if not data:
+        return []
+    items = []
+    for p in data[:15]:
+        name = p.get("name", "")
+        addr = p.get("tokenAddress", "")
+        # 过滤：只要名字不是地址格式的
+        if len(name) > 30 or re.match(r"^[0-9A-Za-z]{30,}$", name or ""):
+            name = addr[:8] + "..." if addr else "?"
+        desc = (p.get("description") or "")[:60]
+        chain = p.get("chainId", "?").upper()
+        items.append({"name": name[:24], "chain": chain, "desc": desc,
+                      "url": p.get("url", "")})
+        if len(items) >= 6:
+            break
+    return items
+
+
+def fetch_trending():
+    """CoinGecko 热门搜索"""
+    data = http_json("https://api.coingecko.com/api/v3/search/trending")
+    if not data:
+        return []
+    coins = data.get("coins", [])[:6]
+    return [{"name": c["item"]["name"], "symbol": c["item"]["symbol"].upper(),
+             "rank": c["item"].get("market_cap_rank", "?")} for c in coins]
+
+
+# ── 5. 社区热议 (Reddit) ────────────────────────────────
+
+def fetch_reddit():
+    """r/CryptoCurrency 热帖"""
+    data = http_json("https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5", timeout=12)
+    if not data:
+        return []
+    items = []
+    for post in data.get("data", {}).get("children", [])[:5]:
+        d = post["data"]
+        items.append({
+            "title": d.get("title", ""),
+            "score": d.get("score", 0),
+            "comments": d.get("num_comments", 0),
+            "url": f"https://reddit.com{d.get('permalink', '')}",
+        })
+    return items
+
+
+# ── 6. AI 前沿 ──────────────────────────────────────────
+
+def fetch_hn_ai():
+    """Hacker News → AI 相关热帖"""
+    ids = http_json("https://hacker-news.firebaseio.com/v0/topstories.json")
+    if not ids:
+        return []
+    items = []
+    for item_id in ids[:50]:
+        item = http_json(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json")
+        if not item:
+            continue
+        title = item.get("title", "")
+        if any(kw.lower() in title.lower() for kw in AI_KEYWORDS):
+            items.append({
+                "title": title,
+                "score": item.get("score", 0),
+                "comments": item.get("descendants", 0),
+                "url": item.get("url", f"https://news.ycombinator.com/item?id={item_id}"),
+            })
+        if len(items) >= 5:
+            break
+        time.sleep(0.05)
+    return sorted(items, key=lambda x: -x["score"]) if items else []
+
+
+def fetch_arxiv():
+    """arXiv 今日 AI 论文"""
+    papers = []
+    try:
+        params = {
+            "search_query": "cat:cs.AI+OR+cat:cs.CL+OR+cat:cs.CV",
+            "sortBy": "submittedDate", "sortOrder": "descending", "max_results": 4,
+        }
+        r = requests.get("http://export.arxiv.org/api/query", params=params,
+                         headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return papers
+        ns = {"a": "http://www.w3.org/2005/Atom"}
+        root = ET.fromstring(r.text)
+        for entry in root.findall("a:entry", ns):
+            title = entry.find("a:title", ns)
+            summary = entry.find("a:summary", ns)
+            link = entry.find("a:id", ns)
+            papers.append({
+                "title": (title.text or "").strip().replace("\n", " ")[:120],
+                "summary": t((summary.text or "").strip().replace("\n", " ")[:120]),
+                "url": (link.text or "").strip(),
+            })
+    except Exception:
+        pass
+    return papers
+
+
+# ── 7. HTML 邮件 ────────────────────────────────────────
+
+STYLE = """
+body{margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,
+'PingFang SC','Microsoft YaHei',sans-serif;color:#222}
+.wrap{max-width:600px;margin:0 auto;background:#fff}
+.header{background:linear-gradient(135deg,#07C160,#05a04a);padding:24px 20px;text-align:center}
+.header h1{margin:0;font-size:20px;color:#fff}
+.header .date{margin-top:4px;font-size:12px;color:rgba(255,255,255,.8)}
+.section{padding:16px 18px;border-bottom:6px solid #f5f5f5}
+.section-title{font-size:16px;font-weight:700;margin:0 0 12px 0;color:#111}
+.section-title .icon{margin-right:6px}
+.market-grid{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px}
+.market-item{flex:1;min-width:100px;background:#f9fafb;border-radius:8px;padding:10px 12px;text-align:center}
+.market-item .label{font-size:11px;color:#999}
+.market-item .value{font-size:18px;font-weight:700;margin-top:2px}
+.market-item .sub{font-size:11px;color:#888;margin-top:1px}
+.coin-table{width:100%;border-collapse:collapse;font-size:13px}
+.coin-table th{text-align:left;padding:6px 8px;background:#f9fafb;color:#888;font-weight:500;font-size:11px}
+.coin-table td{padding:7px 8px;border-bottom:1px solid #f0f0f0}
+.coin-table .coin{font-weight:600}.up{color:#07C160}.down{color:#e94560}
+.news-list{list-style:none;padding:0;margin:0}
+.news-list li{padding:10px 0;border-bottom:1px solid #f0f0f0}
+.news-list li:last-child{border-bottom:none}
+.news-list a{color:#333;text-decoration:none;font-size:14px;line-height:1.5;display:block}
+.news-list a:hover{color:#07C160}
+.news-list .meta{font-size:11px;color:#aaa;margin-top:2px}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;margin-right:4px}
+.tag-green{background:#e6f9f0;color:#07C160}.tag-red{background:#fde8e8;color:#e94560}
+.tag-grey{background:#f0f0f0;color:#666}.tag-blue{background:#e8f0fe;color:#1a73e8}
+.kol-item{padding:10px 0;border-bottom:1px solid #f0f0f0}
+.kol-item:last-child{border-bottom:none}
+.kol-item .kol-name{font-size:11px;color:#07C160;font-weight:600;margin-bottom:3px}
+.kol-item .kol-text{font-size:13px;line-height:1.5;color:#333}
+.kol-item a{color:#333;text-decoration:none}
+.footer{text-align:center;padding:16px;font-size:11px;color:#bbb}
+.good{color:#07C160}.bad{color:#e94560}
+.divider{width:100%;height:6px;background:#f5f5f5}
+"""
 
 
 def fmt_pct(v):
-    if v is None:
-        return "-"
-    return f"+{v:.2f}%" if v > 0 else f"{v:.2f}%"
+    return f"+{v:.2f}%" if v >= 0 else f"{v:.2f}%"
 
 
 def fmt_vol(v):
-    if v is None:
-        return "-"
     if v >= 1e9:
         return f"${v/1e9:.1f}B"
     if v >= 1e6:
@@ -130,639 +385,230 @@ def fmt_vol(v):
 
 
 def fmt_price(p):
-    if p is None:
-        return "-"
     return f"${p:.4f}" if p < 1 else f"${p:,.2f}"
 
 
-# ══════════════════════════════════════════════════════════
-#  币圈数据源
-# ══════════════════════════════════════════════════════════
-
-def fetch_prices(ex):
-    """主流币价格 + 涨跌幅"""
-    rows = []
-    for sym in COINS:
-        try:
-            t = ex.fetch_ticker(sym)
-            ohlcv = ex.fetch_ohlcv(sym, "1d", limit=7)
-            chg_7d = (ohlcv[-1][4] - ohlcv[0][4]) / ohlcv[0][4] * 100 if len(ohlcv) >= 7 else 0
-            coin = sym.split("/")[0]
-            rows.append({
-                "coin": coin,
-                "price": t["last"],
-                "chg_24h": t.get("percentage", 0) or 0,
-                "chg_7d": chg_7d,
-                "volume": t.get("quoteVolume", 0) or 0,
-            })
-        except Exception:
-            pass
-    return rows
-
-
-def fetch_fear_greed(proxies):
-    """恐惧贪婪指数"""
-    try:
-        data = fetch_json(FEAR_GREED_URL, proxies=proxies)["data"][0]
-        return {"value": int(data["value"]), "classification": data["value_classification"]}
-    except Exception:
-        return None
-
-
-def fetch_global_market(proxies):
-    """全球总市值 + BTC/ETH 市占率"""
-    try:
-        data = fetch_json(COINGECKO_GLOBAL, proxies=proxies)["data"]
-        return {
-            "total_mcap": data["total_market_cap"]["usd"],
-            "total_vol": data.get("total_volume", {}).get("usd", 0),
-            "btc_dom": data["market_cap_percentage"]["btc"],
-            "eth_dom": data["market_cap_percentage"]["eth"],
-            "chg_24h": data.get("market_cap_change_percentage_24h_usd", 0),
-        }
-    except Exception:
-        return None
-
-
-def fetch_trending(proxies):
-    """CoinGecko 热门搜索"""
-    try:
-        coins = fetch_json(COINGECKO_TRENDING, proxies=proxies).get("coins", [])[:7]
-        return [{
-            "name": c["item"]["name"],
-            "symbol": c["item"]["symbol"].upper(),
-            "rank": c["item"].get("market_cap_rank", "?"),
-            "score": c["item"].get("score", 0),
-        } for c in coins]
-    except Exception:
-        return []
-
-
-def fetch_categories(proxies):
-    """CoinGecko 板块涨跌 — 发现热门赛道"""
-    try:
-        cats = fetch_json(COINGECKO_CATEGORIES, proxies=proxies)
-        # 只保留有趣的板块
-        INTERESTING = {
-            "layer-2", "layer-1", "meme-token", "artificial-intelligence",
-            "defi", "gaming", "decentralized-exchange", "real-world-assets",
-            "solana-ecosystem", "bitcoin-ecosystem", "depin",
-            "liquid-staking", "restaking", "modular-blockchain",
-        }
-        filtered = [c for c in cats if c.get("id", "") in INTERESTING]
-        # 按 24h 涨幅排序，区分涨/跌
-        up = sorted([c for c in filtered if c.get("market_cap_change_24h", 0) > 0],
-                     key=lambda x: -x["market_cap_change_24h"])[:5]
-        down = sorted([c for c in filtered if c.get("market_cap_change_24h", 0) < 0],
-                       key=lambda x: x["market_cap_change_24h"])[:3]
-        # 翻译板块名
-        CAT_CN = {
-            "layer-2": "Layer 2", "layer-1": "Layer 1", "meme-token": "Meme币",
-            "artificial-intelligence": "AI概念", "defi": "DeFi", "gaming": "游戏",
-            "decentralized-exchange": "DEX", "real-world-assets": "RWA",
-            "solana-ecosystem": "Solana生态", "bitcoin-ecosystem": "BTC生态",
-            "depin": "DePIN", "liquid-staking": "流动性质押",
-            "restaking": "再质押", "modular-blockchain": "模块化区块链",
-        }
-        for c in up + down:
-            c["name_cn"] = CAT_CN.get(c.get("id", ""), c.get("name", ""))
-        return {"up": up, "down": down}
-    except Exception:
-        return {"up": [], "down": []}
-
-
-def fetch_top_movers(ex):
-    """24h涨跌榜"""
-    gainers, losers = [], []
-    try:
-        tickers = ex.fetch_tickers()
-        exclude = {"USDC", "BUSD", "DAI", "TUSD", "FDUSD", "WBTC", "WETH"}
-        pairs = [(s, t) for s, t in tickers.items()
-                 if s.endswith("/USDT") and s.split("/")[0] not in exclude]
-        sorted_p = sorted(pairs, key=lambda x: x[1].get("percentage", 0) or 0)
-
-        seen = set()
-        for sym, t in sorted_p[-60:][::-1]:
-            coin = sym.split("/")[0]
-            if coin not in seen:
-                seen.add(coin)
-                gainers.append({"coin": coin, "pct": t.get("percentage", 0) or 0,
-                                "vol": t.get("quoteVolume", 0) or 0})
-            if len(gainers) >= 5:
-                break
-
-        seen.clear()
-        for sym, t in sorted_p[:60]:
-            coin = sym.split("/")[0]
-            if coin not in seen:
-                seen.add(coin)
-                losers.append({"coin": coin, "pct": t.get("percentage", 0) or 0,
-                               "vol": t.get("quoteVolume", 0) or 0})
-            if len(losers) >= 5:
-                break
-    except Exception:
-        pass
-    return gainers, losers
-
-
-def fetch_dex_latest(proxies):
-    """DexScreener 最新代币（一级市场探测器）"""
-    try:
-        profiles = fetch_json(DEX_LATEST, proxies=proxies)
-        items = []
-        for p in profiles[:8]:
-            desc = (p.get("description") or "")[:80]
-            items.append({
-                "name": (p.get("name") or p.get("tokenAddress", "?"))[:24],
-                "chain": p.get("chainId", "?").upper(),
-                "desc": desc,
-                "url": p.get("url", ""),
-            })
-        return items
-    except Exception:
-        return []
-
-
-def fetch_crypto_news(proxies):
-    """CryptoPanic 快讯（含 KOL 推文汇聚）"""
-    items = []
-    try:
-        data = fetch_json(CRYPTOPANIC_NEWS, proxies=proxies)
-        for p in data.get("results", [])[:8]:
-            title = p.get("title", "")
-            url = p.get("url", "")
-            # 来源标注
-            source = p.get("source", {}).get("title", "")
-            items.append({"title": translate(title), "url": url, "source": source})
-    except Exception:
-        pass
-    return items
-
-
-def fetch_reddit_hot(proxies):
-    """Reddit r/CryptoCurrency 热帖"""
-    items = []
-    try:
-        data = fetch_json(REDDIT_CRYPTO, proxies=proxies)
-        for post in data.get("data", {}).get("children", [])[:5]:
-            d = post["data"]
-            items.append({
-                "title": d.get("title", ""),
-                "score": d.get("score", 0),
-                "comments": d.get("num_comments", 0),
-                "url": f"https://reddit.com{d.get('permalink', '')}",
-            })
-    except Exception:
-        pass
-    return items
-
-
-# ══════════════════════════════════════════════════════════
-#  AI 数据源
-# ══════════════════════════════════════════════════════════
-
-def fetch_hn_ai(proxies):
-    """Hacker News 热帖 → 筛选 AI 相关"""
-    items = []
-    try:
-        ids = fetch_json(HN_TOP, proxies=proxies)[:40]
-        for item_id in ids:
-            try:
-                item = fetch_json(HN_ITEM.format(item_id), proxies=proxies)
-                title = item.get("title", "")
-                if any(kw.lower() in title.lower() for kw in AI_KEYWORDS):
-                    items.append({
-                        "title": title,
-                        "score": item.get("score", 0),
-                        "comments": item.get("descendants", 0),
-                        "url": item.get("url", f"https://news.ycombinator.com/item?id={item_id}"),
-                    })
-                if len(items) >= 6:
-                    break
-            except Exception:
-                continue
-            time.sleep(0.1)  # HN API 友好节流
-    except Exception:
-        pass
-    return sorted(items, key=lambda x: -x["score"]) if items else []
-
-
-def fetch_arxiv(proxies):
-    """arXiv 最新 AI 论文 (cs.AI + cs.CL + cs.CV 合并)"""
-    papers = []
-    try:
-        params = {
-            "search_query": "cat:cs.AI+OR+cat:cs.CL+OR+cat:cs.CV",
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-            "max_results": 6,
-        }
-        r = requests.get(ARXIV_API, params=params, timeout=20, proxies=proxies)
-        # 简单解析 XML（不引入额外依赖）
-        import xml.etree.ElementTree as ET
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        root = ET.fromstring(r.text)
-        for entry in root.findall("atom:entry", ns):
-            title = entry.find("atom:title", ns)
-            summary = entry.find("atom:summary", ns)
-            link = entry.find("atom:id", ns)
-            papers.append({
-                "title": (title.text or "").strip().replace("\n", " ")[:120],
-                "summary": translate((summary.text or "").strip().replace("\n", " ")[:150]),
-                "url": (link.text or "").strip(),
-            })
-    except Exception:
-        pass
-    return papers
-
-
-def fetch_github_ai(proxies):
-    """GitHub 最近一周 AI 相关高星项目"""
-    repos = []
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-        q = f"created:>={since}+topic:artificial-intelligence"
-        params = {"q": q, "sort": "stars", "order": "desc", "per_page": 5}
-        r = requests.get(GITHUB_AI, headers=HEADERS, params=params, timeout=15, proxies=proxies)
-        data = r.json()
-        for item in data.get("items", []):
-            repos.append({
-                "name": item.get("full_name", ""),
-                "desc": (item.get("description") or "")[:100],
-                "stars": item.get("stargazers_count", 0),
-                "lang": item.get("language", ""),
-                "url": item.get("html_url", ""),
-            })
-    except Exception:
-        pass
-    return repos
-
-
-# ══════════════════════════════════════════════════════════
-#  HTML 邮件生成
-# ══════════════════════════════════════════════════════════
-
-CSS = """
-body { margin:0; padding:0; background:#0f0f1a; font-family: -apple-system, BlinkMacSystemFont,
-  'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; color:#e0e0e0; }
-.container { max-width:640px; margin:0 auto; padding:20px; }
-.header { text-align:center; padding:28px 20px 18px;
-  background:linear-gradient(135deg, #0a0a16 0%, #16213e 100%); border-radius:12px 12px 0 0; }
-.header h1 { margin:0; font-size:22px; color:#07C160; }
-.header .date { margin-top:6px; font-size:13px; color:#888; }
-.card { background:#1a1a2e; border-radius:0; margin-bottom:2px; padding:18px 20px; }
-.card-first { border-radius:0 0 12px 12px; }
-.card-last { border-radius:12px 12px 0 0; }
-.section-title { font-size:16px; font-weight:700; margin:0 0 14px 0; padding-left:10px;
-  border-left:3px solid #07C160; color:#f0f0f0; }
-table { width:100%; border-collapse:collapse; font-size:14px; }
-th { text-align:left; padding:8px 6px; border-bottom:1px solid #2a2a4a; color:#999;
-  font-weight:500; font-size:12px; }
-td { padding:8px 6px; border-bottom:1px solid #1f1f3a; }
-.up { color:#07C160; } .down { color:#e94560; }
-.news-item { padding:10px 0; border-bottom:1px solid #1f1f3a; }
-.news-item:last-child { border-bottom:none; }
-.news-item a { color:#e0e0e0; text-decoration:none; font-size:14px; line-height:1.5; }
-.news-item a:hover { color:#07C160; }
-.news-meta { font-size:11px; color:#666; margin-top:3px; }
-.tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px;
-  margin-right:4px; }
-.tag-up { background:#0d3320; color:#07C160; }
-.tag-down { background:#331111; color:#e94560; }
-.tag-chain { background:#1a1a3e; color:#6688cc; }
-.section-divider { height:8px; background:#0f0f1a; }
-.footer { text-align:center; padding:20px; font-size:11px; color:#555; }
-.footer a { color:#555; }
-.badge { display:inline-block; background:#07C160; color:#000; padding:1px 6px;
-  border-radius:3px; font-size:10px; font-weight:700; margin-left:4px; }
-"""
-
-
 def build_html(ctx):
-    """组装 HTML"""
     now = ctx["now"]
     date_str = now.strftime("%Y年%m月%d日")
-    weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
+    wd = ["一","二","三","四","五","六","日"][now.weekday()]
+    btc = ctx.get("prices", [{}])
+    btc_p = f"${btc[0]['price']:,.0f}" if btc and btc[0].get("price") else "?"
 
-    parts = [f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>每日简报 {date_str}</title><style>{CSS}</style></head><body>
-<div class="container">
-<div class="header">
-  <h1>每日简报</h1>
-  <div class="date">{date_str} 星期{weekday} · 自动生成</div>
-</div>"""]
+    h = []
+    h.append(f'<!DOCTYPE html><html><head><meta charset="utf-8">'
+             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+             f'<title>每日简报 {date_str}</title><style>{STYLE}</style></head><body>'
+             f'<div class="wrap">')
+
+    # Header
+    h.append(f'<div class="header"><h1>每日简报</h1>'
+             f'<div class="date">{date_str} 星期{wd} · BTC {btc_p}</div></div>')
 
     # ── 1. 市场概览 ──
-    parts.append('<div class="card card-last">')
-    parts.append('<div class="section-title">市场概览</div>')
-
-    # 恐惧贪婪 + 全球市值
+    prices = ctx.get("prices", [])
     fg = ctx.get("fear_greed")
     gm = ctx.get("global_market")
-    if fg or gm:
-        parts.append('<table><tr>')
+
+    if prices or fg or gm:
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>市场概览</div>')
+
+        # 关键指标卡片
+        h.append('<div class="market-grid">')
         if fg:
             emoji = "🟢" if fg["value"] < 30 else ("🟡" if fg["value"] < 60 else "🔴")
-            parts.append(f'<td style="width:50%"><span style="color:#999;font-size:12px">恐惧贪婪</span><br>'
-                         f'<b style="font-size:20px">{fg["value"]}</b> {emoji}<br>'
-                         f'<span style="font-size:12px;color:#888">{fg["classification"]}</span></td>')
+            color_cls = "good" if fg["value"] < 30 else ("bad" if fg["value"] > 60 else "")
+            h.append(f'<div class="market-item"><div class="label">恐惧贪婪</div>'
+                     f'<div class="value {color_cls}">{fg["value"]} {emoji}</div>'
+                     f'<div class="sub">{fg["label"]}</div></div>')
         if gm:
-            parts.append(f'<td style="width:50%"><span style="color:#999;font-size:12px">全球市值</span><br>'
-                         f'<b style="font-size:18px">${gm["total_mcap"]/1e12:.2f}T</b><br>'
-                         f'<span style="font-size:12px" class="{"up" if gm["chg_24h"]>0 else "down"}">'
-                         f'{fmt_pct(gm["chg_24h"])}</span></td>')
-        parts.append('</tr></table>')
-        if gm:
-            parts.append(f'<div style="margin-top:8px;font-size:12px;color:#888">'
-                         f'BTC市占 {gm["btc_dom"]:.1f}% · ETH {gm["eth_dom"]:.1f}% · '
-                         f'24h成交量 ${gm["total_vol"]/1e9:.0f}B</div>')
+            cls = "good" if gm["chg"] > 0 else "bad"
+            h.append(f'<div class="market-item"><div class="label">全球市值</div>'
+                     f'<div class="value">${gm["mcap"]/1e12:.2f}T</div>'
+                     f'<div class="sub {cls}">{fmt_pct(gm["chg"])}</div></div>')
+            h.append(f'<div class="market-item"><div class="label">BTC市占率</div>'
+                     f'<div class="value">{gm["btc_dom"]:.1f}%</div>'
+                     f'<div class="sub">ETH {gm["eth_dom"]:.1f}%</div></div>')
+        h.append('</div>')
 
-    # 主流币表格
-    rows = ctx.get("prices", [])
-    if rows:
-        parts.append('<table style="margin-top:14px"><tr>'
-                     '<th>币种</th><th>价格</th><th>24h</th><th>7日</th><th>成交量</th></tr>')
-        for r in rows:
-            chg24_cls = "up" if r["chg_24h"] > 0 else "down"
-            chg7_cls = "up" if r["chg_7d"] > 0 else "down"
-            parts.append(f'<tr><td><b>{r["coin"]}</b></td>'
+        # 币价表
+        if prices:
+            h.append('<table class="coin-table"><tr><th>币种</th><th>价格</th><th>24h涨跌</th>'
+                     '<th>24h成交量</th><th>24h高/低</th></tr>')
+            for r in prices:
+                cls = "up" if r["chg_24h"] >= 0 else "down"
+                hi = r.get("high", 0)
+                lo = r.get("low", 0)
+                h.append(f'<tr><td class="coin">{r["coin"]}</td>'
                          f'<td>{fmt_price(r["price"])}</td>'
-                         f'<td class="{chg24_cls}">{fmt_pct(r["chg_24h"])}</td>'
-                         f'<td class="{chg7_cls}">{fmt_pct(r["chg_7d"])}</td>'
-                         f'<td>{fmt_vol(r["volume"])}</td></tr>')
-        parts.append('</table>')
-    parts.append('</div>')
+                         f'<td class="{cls}">{fmt_pct(r["chg_24h"])}</td>'
+                         f'<td>{fmt_vol(r["volume"])}</td>'
+                         f'<td style="font-size:11px;color:#888">{fmt_price(hi)}/{fmt_price(lo)}</td></tr>')
+            h.append('</table>')
+        h.append('</div>')
 
-    # ── 2. 热门板块 ──
-    cats = ctx.get("categories", {})
-    if cats.get("up") or cats.get("down"):
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">热门板块</div>')
-        if cats.get("up"):
-            items = " · ".join(
-                f'<span class="tag tag-up">{c.get("name_cn", c.get("name",""))} '
-                f'↑{c.get("market_cap_change_24h",0):.1f}%</span>'
-                for c in cats["up"][:6]
-            )
-            parts.append(f'<div style="margin-bottom:6px">{items}</div>')
-        if cats.get("down"):
-            items = " · ".join(
-                f'<span class="tag tag-down">{c.get("name_cn", c.get("name",""))} '
-                f'↓{abs(c.get("market_cap_change_24h",0)):.1f}%</span>'
-                for c in cats["down"][:3]
-            )
-            parts.append(f'<div>{items}</div>')
-        parts.append('</div>')
+    # ── 2. 快讯 (CryptoPanic) ──
+    news = ctx.get("news", [])
+    if news:
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>币圈快讯</div>')
+        h.append('<ul class="news-list">')
+        for n in news[:6]:
+            src = f'<span class="tag tag-grey">{n["source"]}</span>' if n.get("source") else ""
+            h.append(f'<li>{src}<a href="{n["url"]}">{n["title"]}</a></li>')
+        h.append('</ul></div>')
 
-    # ── 3. 涨跌榜 ──
-    gainers = ctx.get("gainers", [])
-    losers = ctx.get("losers", [])
-    if gainers or losers:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">24h涨跌榜</div>')
-        parts.append('<table><tr><th>涨幅</th><th></th><th></th>'
-                     '<th style="padding-left:16px">跌幅</th><th></th><th></th></tr>')
-        for i in range(5):
-            gl = gainers[i] if i < len(gainers) else None
-            ll = losers[i] if i < len(losers) else None
-            parts.append('<tr>')
-            if gl:
-                parts.append(f'<td><b>{gl["coin"]}</b></td>'
-                             f'<td class="up">{fmt_pct(gl["pct"])}</td>'
-                             f'<td style="font-size:11px;color:#888">{fmt_vol(gl["vol"])}</td>')
-            else:
-                parts.append('<td></td><td></td><td></td>')
-            if ll:
-                parts.append(f'<td style="padding-left:16px"><b>{ll["coin"]}</b></td>'
-                             f'<td class="down">{fmt_pct(ll["pct"])}</td>'
-                             f'<td style="font-size:11px;color:#888">{fmt_vol(ll["vol"])}</td>')
-            else:
-                parts.append('<td></td><td></td><td></td>')
-            parts.append('</tr>')
-        parts.append('</table></div>')
+    # ── 3. X KOL 观点 ──
+    kols = ctx.get("kols", [])
+    if kols:
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>X 大V观点</div>')
+        for tw in kols[:6]:
+            h.append(f'<div class="kol-item">'
+                     f'<div class="kol-name"><span class="tag tag-green">{tw["handle"]}</span></div>'
+                     f'<a href="{tw["url"]}"><div class="kol-text">{t(tw["title"])}</div></a>'
+                     f'</div>')
+        h.append('</div>')
 
-    # ── 4. CoinGecko 热门搜索 ──
+    # ── 4. 热门搜索 ──
     trending = ctx.get("trending", [])
     if trending:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">热门搜索</div>')
-        parts.append('<table><tr><th>#</th><th>名称</th><th>代号</th><th>市值排名</th></tr>')
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>热门搜索 · CoinGecko</div>')
+        tags = []
         for i, c in enumerate(trending):
-            parts.append(f'<tr><td>{i+1}</td><td><b>{c["name"]}</b></td>'
-                         f'<td>{c["symbol"]}</td><td>#{c["rank"]}</td></tr>')
-        parts.append('</table></div>')
+            tags.append(f'<span class="tag tag-blue">{i+1}. {c["name"]} ({c["symbol"]})</span>')
+        h.append(f'<div style="line-height:2">{" ".join(tags)}</div></div>')
 
-    # ── 5. 一级市场 (DexScreener 新代币) ──
-    dex = ctx.get("dex_latest", [])
+    # ── 5. 一级市场 ──
+    dex = ctx.get("dex", [])
     if dex:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">一级市场 · 新代币<span class="badge">DexScreener</span></div>')
-        for item in dex[:6]:
-            chain_tag = f'<span class="tag tag-chain">{item["chain"]}</span>'
-            desc = item.get("desc", "")
-            parts.append(f'<div class="news-item">'
-                         f'<div><a href="{item["url"]}"><b>{item["name"]}</b></a> {chain_tag}</div>'
-                         f'<div class="news-meta">{desc}</div>'
-                         f'</div>')
-        parts.append('</div>')
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>一级市场 · 新代币</div>')
+        h.append('<ul class="news-list">')
+        for item in dex:
+            h.append(f'<li><span class="tag tag-grey">{item["chain"]}</span>'
+                     f'<a href="{item["url"]}"><b>{item["name"]}</b></a>'
+                     f'<div class="meta">{item["desc"]}</div></li>')
+        h.append('</ul></div>')
 
-    # ── 6. 币圈快讯 ──
-    news = ctx.get("crypto_news", [])
-    if news:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">币圈快讯<span class="badge">CryptoPanic</span></div>')
-        for n in news:
-            source_tag = f'<span style="color:#07C160;font-size:11px">[{n["source"]}]</span> ' if n.get("source") else ""
-            parts.append(f'<div class="news-item">'
-                         f'<div>{source_tag}<a href="{n["url"]}">{n["title"]}</a></div>'
-                         f'</div>')
-        parts.append('</div>')
-
-    # ── 7. Reddit 社区热议 ──
+    # ── 6. 社区热议 ──
     reddit = ctx.get("reddit", [])
     if reddit:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card">')
-        parts.append('<div class="section-title">社区热议<span class="badge">r/CryptoCurrency</span></div>')
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>r/CryptoCurrency 热议</div>')
+        h.append('<ul class="news-list">')
         for r in reddit:
-            parts.append(f'<div class="news-item">'
-                         f'<a href="{r["url"]}">{r["title"]}</a>'
-                         f'<div class="news-meta">⬆ {r["score"]} · 💬 {r["comments"]} 评论</div>'
-                         f'</div>')
-        parts.append('</div>')
+            h.append(f'<li><a href="{r["url"]}">{r["title"]}</a>'
+                     f'<div class="meta">⬆ {r["score"]} · 💬 {r["comments"]}</div></li>')
+        h.append('</ul></div>')
 
-    # ── 8. AI 前沿 ──
+    # ── 7. AI 前沿 ──
     hn = ctx.get("hn_ai", [])
     arxiv = ctx.get("arxiv", [])
-    gh = ctx.get("github_ai", [])
+    if hn or arxiv:
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>AI 前沿</div>')
 
-    if hn or arxiv or gh:
-        parts.append('<div class="section-divider"></div>')
-        parts.append('<div class="card" style="border-left:3px solid #7c3aed">')
-        parts.append('<div class="section-title" style="border-left-color:#7c3aed">AI 前沿</div>')
-
-        # Hacker News
         if hn:
-            parts.append('<div style="margin-bottom:14px"><b style="font-size:13px;color:#aaa">'
-                         'Hacker News 热议</b></div>')
-            for item in hn[:5]:
-                parts.append(f'<div class="news-item">'
-                             f'<a href="{item["url"]}">{item["title"]}</a>'
-                             f'<div class="news-meta">⬆ {item["score"]} · 💬 {item["comments"]} 评论</div>'
-                             f'</div>')
+            h.append('<ul class="news-list">')
+            for item in hn[:4]:
+                h.append(f'<li><a href="{item["url"]}">{item["title"]}</a>'
+                         f'<div class="meta">HN ⬆ {item["score"]} · 💬 {item["comments"]}</div></li>')
+            h.append('</ul>')
 
-        # arXiv 论文
         if arxiv:
-            parts.append('<div style="margin:16px 0 8px 0"><b style="font-size:13px;color:#aaa">'
-                         '最新论文</b></div>')
-            for p in arxiv[:4]:
-                parts.append(f'<div class="news-item">'
-                             f'<a href="{p["url"]}">{p["title"]}</a>'
-                             f'<div class="news-meta">{p.get("summary", "")}</div>'
-                             f'</div>')
+            h.append('<div style="margin-top:10px;font-size:12px;color:#888;font-weight:600">最新论文</div>')
+            h.append('<ul class="news-list">')
+            for p in arxiv[:3]:
+                h.append(f'<li><a href="{p["url"]}">{p["title"]}</a>'
+                         f'<div class="meta">{p.get("summary","")}</div></li>')
+            h.append('</ul>')
+        h.append('</div>')
 
-        # GitHub
-        if gh:
-            parts.append('<div style="margin:16px 0 8px 0"><b style="font-size:13px;color:#aaa">'
-                         '开源项目 · 本周新高</b></div>')
-            for repo in gh:
-                lang_tag = f'<span class="tag tag-chain">{repo["lang"]}</span>' if repo.get("lang") else ""
-                parts.append(f'<div class="news-item">'
-                             f'<a href="{repo["url"]}"><b>{repo["name"]}</b></a> {lang_tag} '
-                             f'<span style="font-size:11px;color:#999">⭐ {repo["stars"]}</span>'
-                             f'<div class="news-meta">{repo.get("desc","")}</div>'
-                             f'</div>')
-        parts.append('</div>')
-
-    # ── 页脚 ──
-    parts.append(f"""<div class="footer">
-每日自动生成于 {now.strftime('%Y-%m-%d %H:%M UTC')} · GitHub Actions<br>
-数据来源: Binance · CoinGecko · DexScreener · CryptoPanic · Reddit · HN · arXiv · GitHub
-</div></div></body></html>""")
-
-    return "\n".join(parts)
+    # Footer
+    h.append(f'<div class="footer">每日自动生成 · {now.strftime("%Y-%m-%d %H:%M UTC")}<br>'
+             f'数据: Binance · CoinGecko · CryptoPanic · Nitter(X) · DexScreener · Reddit · HN · arXiv</div>')
+    h.append('</div></body></html>')
+    return "\n".join(h)
 
 
-# ══════════════════════════════════════════════════════════
-#  邮件发送
-# ══════════════════════════════════════════════════════════
+# ── 8. 邮件 ─────────────────────────────────────────────
 
 def send_email(html, subject):
     cfg = get_config()
-    to_addr = cfg["email_to"]
-    smtp_user = cfg["email_smtp_user"]
-    smtp_pass = cfg["email_smtp_pass"]
-
-    if not to_addr or not smtp_pass:
-        print("[FAIL] 邮件配置缺失：EMAIL_TO / EMAIL_SMTP_PASS 未设置")
+    if not cfg["to"] or not cfg["pass"]:
+        print("[FAIL] 邮件配置缺失")
         return False
-
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = to_addr
+    msg["From"] = cfg["user"]
+    msg["To"] = cfg["to"]
     msg.attach(MIMEText(html, "html", "utf-8"))
-
     try:
-        server = smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=15)
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, [to_addr], msg.as_string())
-        server.quit()
-        print(f"[OK] 邮件已发送 → {to_addr}")
+        s = smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=15)
+        s.login(cfg["user"], cfg["pass"])
+        s.sendmail(cfg["user"], [cfg["to"]], msg.as_string())
+        s.quit()
+        print(f"[OK] 邮件已发送 → {cfg['to']}")
         return True
     except Exception as e:
-        print(f"[FAIL] 邮件发送失败: {e}")
+        print(f"[FAIL] 邮件发送: {e}")
         return False
 
 
-# ══════════════════════════════════════════════════════════
-#  主流程
-# ══════════════════════════════════════════════════════════
+# ── 9. 主流程 ───────────────────────────────────────────
 
 def main():
     now = datetime.now(timezone.utc)
-    print(f"[{now:%Y-%m-%d %H:%M:%S} UTC] 开始生成每日简报...")
+    print(f"[{now:%Y-%m-%d %H:%M:%S} UTC] 每日简报 v2 开始...")
 
-    proxies = get_proxies()
+    print("[1] 市场数据...")
+    prices = fetch_binance_prices()
+    print(f"    币价: {len(prices)}个")
+    fg = fetch_fear_greed()
+    gm = fetch_global_market()
 
-    # 并行抓取（顺序执行，但每个独立 try/except）
-    print("[1/11] 币价...")
-    ex = get_public_exchange()
-    prices = fetch_prices(ex)
-    print(f"      获取 {len(prices)} 个币种")
+    print("[2] 币圈快讯...")
+    news = fetch_crypto_news()
+    print(f"    快讯: {len(news)}条")
 
-    print("[2/11] 恐惧贪婪...")
-    fear_greed = fetch_fear_greed(proxies)
+    print("[3] X KOL 观点...")
+    kols = fetch_kol_tweets()
+    print(f"    KOL: {len(kols)}条")
 
-    print("[3/11] 全球市值...")
-    global_mkt = fetch_global_market(proxies)
+    print("[4] 热门搜索 + 一级市场...")
+    trending = fetch_trending()
+    dex = fetch_dex_new()
+    print(f"    热门: {len(trending)}个, 新币: {len(dex)}个")
 
-    print("[4/11] CoinGecko 热门搜索...")
-    trending = fetch_trending(proxies)
+    print("[5] Reddit...")
+    reddit = fetch_reddit()
+    print(f"    热帖: {len(reddit)}条")
 
-    print("[5/11] 板块涨跌...")
-    categories = fetch_categories(proxies)
+    print("[6] AI 前沿...")
+    hn_ai = fetch_hn_ai()
+    arxiv = fetch_arxiv()
+    print(f"    HN: {len(hn_ai)}条, arXiv: {len(arxiv)}篇")
 
-    print("[6/11] 涨跌榜...")
-    gainers, losers = fetch_top_movers(ex)
-
-    print("[7/11] DexScreener 新代币...")
-    dex_latest = fetch_dex_latest(proxies)
-
-    print("[8/11] CryptoPanic 快讯...")
-    crypto_news = fetch_crypto_news(proxies)
-
-    print("[9/11] Reddit 热帖...")
-    reddit = fetch_reddit_hot(proxies)
-
-    print("[10/11] Hacker News AI + arXiv...")
-    hn_ai = fetch_hn_ai(proxies)
-    arxiv = fetch_arxiv(proxies)
-
-    print("[11/11] GitHub AI 项目...")
-    github_ai = fetch_github_ai(proxies)
-
-    # 组装上下文
     ctx = {
-        "now": now,
-        "prices": prices,
-        "fear_greed": fear_greed,
-        "global_market": global_mkt,
-        "trending": trending,
-        "categories": categories,
-        "gainers": gainers,
-        "losers": losers,
-        "dex_latest": dex_latest,
-        "crypto_news": crypto_news,
-        "reddit": reddit,
-        "hn_ai": hn_ai,
-        "arxiv": arxiv,
-        "github_ai": github_ai,
+        "now": now, "prices": prices, "fear_greed": fg, "global_market": gm,
+        "news": news, "kols": kols, "trending": trending, "dex": dex,
+        "reddit": reddit, "hn_ai": hn_ai, "arxiv": arxiv,
     }
-
-    # 生成 HTML
     html = build_html(ctx)
 
-    # 邮件标题
-    btc_price = f"${prices[0]['price']:,.0f}" if prices else "?"
-    subject = f"每日简报 {now.strftime('%m/%d')} | BTC {btc_price}"
+    btc_p = f"${prices[0]['price']:,.0f}" if prices else "?"
+    subject = f"每日简报 {now.strftime('%m/%d')} | BTC {btc_p}"
+    send_email(html, subject)
 
-    # 发送
-    success = send_email(html, subject)
-
-    # 本地也保存一份
-    report_file = os.path.join(BASE, "latest_briefing.html")
-    with open(report_file, "w", encoding="utf-8") as f:
+    # 保存本地
+    out = os.path.join(BASE, "latest_briefing.html")
+    with open(out, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[OK] 简报已保存至 {report_file}")
-
-    return 0 if success else 1
+    print(f"[OK] 已保存 {out}")
+    return 0
 
 
 if __name__ == "__main__":
