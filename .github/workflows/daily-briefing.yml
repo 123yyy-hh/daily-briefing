@@ -1,0 +1,39 @@
+name: Daily Briefing
+
+on:
+  schedule:
+    # UTC 1:00 = 北京时间 9:00 (UTC+8)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily briefing
+        env:
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASS: ${{ secrets.EMAIL_SMTP_PASS }}
+        run: python daily_briefing.py
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-briefing
+          path: latest_briefing.html
+          retention-days: 7
