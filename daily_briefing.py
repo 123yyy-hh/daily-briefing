@@ -18,8 +18,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 DailyBriefing/2.0"}
 # X 上值得关注的币圈 KOL (用户名)
 KOL_LIST = [
     "cz_binance", "VitalikButerin", "saylor", "cobie",
-    "0xKawz", "loomdart", "CryptoCapo_", "CryptoPoseidonn",
-    "BiteyOfBitey", "0xcryptowizard",
+    "justinsuntron", "loomdart", "CryptoCapo_", "CryptoPoseidonn",
+    "0xKawz", "BiteyOfBitey", "0xcryptowizard",
 ]
 
 # Nitter 实例（多备选，自动切换）
