@@ -19,7 +19,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 DailyBriefing/2.0"}
 KOL_LIST = [
     "cz_binance", "VitalikButerin", "saylor", "cobie",
     "justinsuntron", "loomdart", "CryptoCapo_", "CryptoPoseidonn",
-    "0xKawz", "BiteyOfBitey", "0xcryptowizard",
+    "0xKawz", "0xcryptowizard",
 ]
 
 # Nitter 实例（多备选，自动切换）
@@ -225,7 +225,7 @@ def fetch_kol_tweets():
         if tw["url"] not in seen:
             seen.add(tw["url"])
             unique.append(tw)
-    return unique[:8]
+    return unique[:10]
 
 
 # ── 4. 一级市场 ────────────────────────────────────────
@@ -482,7 +482,7 @@ def build_html(ctx):
     if kols:
         h.append('<div class="section">')
         h.append('<div class="section-title"><span class="icon"></span>X 大V观点</div>')
-        for tw in kols[:6]:
+        for tw in kols[:8]:
             h.append(f'<div class="kol-item">'
                      f'<div class="kol-name"><span class="tag tag-green">{tw["handle"]}</span></div>'
                      f'<a href="{tw["url"]}"><div class="kol-text">{t(tw["title"])}</div></a>'
