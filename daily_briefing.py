@@ -352,6 +352,33 @@ def fetch_arxiv():
     return papers
 
 
+def fetch_github_trending():
+    """GitHub 本周热门项目（全语言，排除AI已覆盖的）"""
+    repos = []
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        params = {
+            "q": f"created:>={since} stars:>50",
+            "sort": "stars", "order": "desc", "per_page": 5,
+        }
+        r = requests.get("https://api.github.com/search/repositories",
+                         headers=HEADERS, params=params, timeout=15)
+        if r.status_code != 200:
+            return repos
+        data = r.json()
+        for item in data.get("items", []):
+            repos.append({
+                "name": item.get("full_name", ""),
+                "desc": (item.get("description") or "")[:100],
+                "stars": item.get("stargazers_count", 0),
+                "lang": item.get("language") or "",
+                "url": item.get("html_url", ""),
+            })
+    except Exception:
+        pass
+    return repos
+
+
 # ── 7. HTML 邮件 ────────────────────────────────────────
 
 STYLE = """
@@ -545,9 +572,21 @@ def build_html(ctx):
             h.append('</ul>')
         h.append('</div>')
 
+    # ── 8. GitHub 热门项目 ──
+    gh = ctx.get("github_trending", [])
+    if gh:
+        h.append('<div class="section">')
+        h.append('<div class="section-title"><span class="icon"></span>GitHub 热门新项目</div>')
+        h.append('<ul class="news-list">')
+        for repo in gh:
+            lang_tag = f'<span class="tag tag-grey">{repo["lang"]}</span>' if repo.get("lang") else ""
+            h.append(f'<li>{lang_tag}<a href="{repo["url"]}"><b>{repo["name"]}</b></a>'
+                     f'<div class="meta">{repo.get("desc","")} · ⭐ {repo["stars"]}</div></li>')
+        h.append('</ul></div>')
+
     # Footer
     h.append(f'<div class="footer">每日自动生成 · {now.strftime("%Y-%m-%d %H:%M UTC")}<br>'
-             f'数据: Binance · CoinGecko · CryptoPanic · Nitter(X) · DexScreener · Reddit · HN · arXiv</div>')
+             f'数据: CoinGecko · CoinDesk · Nitter(X) · DexScreener · HN · arXiv · GitHub</div>')
     h.append('</div></body></html>')
     return "\n".join(h)
 
@@ -608,12 +647,13 @@ def main():
     print("[6] AI 前沿...")
     hn_ai = fetch_hn_ai()
     arxiv = fetch_arxiv()
-    print(f"    HN: {len(hn_ai)}条, arXiv: {len(arxiv)}篇")
+    github_trending = fetch_github_trending()
+    print(f"    HN: {len(hn_ai)}条, arXiv: {len(arxiv)}篇, GitHub: {len(github_trending)}个")
 
     ctx = {
         "now": now, "prices": prices, "fear_greed": fg, "global_market": gm,
         "news": news, "kols": kols, "trending": trending, "dex": dex,
-        "reddit": reddit, "hn_ai": hn_ai, "arxiv": arxiv,
+        "reddit": reddit, "hn_ai": hn_ai, "arxiv": arxiv, "github_trending": github_trending,
     }
     html = build_html(ctx)
 
