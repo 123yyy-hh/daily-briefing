@@ -535,7 +535,7 @@ def build_html(ctx):
         for item in dex:
             h.append(f'<li><span class="tag tag-grey">{item["chain"]}</span>'
                      f'<a href="{item["url"]}"><b>{item["name"]}</b></a>'
-                     f'<div class="meta">{item["desc"]}</div></li>')
+                     f'<div class="meta">{t(item["desc"])}</div></li>')
         h.append('</ul></div>')
 
     # ── 6. 社区热议 ──
@@ -581,7 +581,7 @@ def build_html(ctx):
         for repo in gh:
             lang_tag = f'<span class="tag tag-grey">{repo["lang"]}</span>' if repo.get("lang") else ""
             h.append(f'<li>{lang_tag}<a href="{repo["url"]}"><b>{repo["name"]}</b></a>'
-                     f'<div class="meta">{repo.get("desc","")} · ⭐ {repo["stars"]}</div></li>')
+                     f'<div class="meta">{t(repo.get("desc",""))} · ⭐ {repo["stars"]}</div></li>')
         h.append('</ul></div>')
 
     # Footer
