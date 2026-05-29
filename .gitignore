@@ -4,3 +4,4 @@ config.json
 .env
 state.json
 *.log
+latest_briefing.html
