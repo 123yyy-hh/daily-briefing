@@ -98,8 +98,7 @@ def fetch_prices():
               "SUI": "sui", "DOGE": "dogecoin", "LINK": "chainlink"}
     cg = http_json(
         f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(cg_map.values())}"
-        f"&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
-        f"&include_24hr_high_low=true",
+        f"&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true",
         timeout=20
     )
     if not cg:
@@ -111,9 +110,7 @@ def fetch_prices():
             continue
         rows.append({"coin": coin, "price": d.get("usd", 0),
                      "chg_24h": d.get("usd_24h_change", 0) or 0,
-                     "volume": d.get("usd_24h_vol", 0) or 0,
-                     "high": d.get("usd_24h_high", 0) or 0,
-                     "low": d.get("usd_24h_low", 0) or 0})
+                     "volume": d.get("usd_24h_vol", 0) or 0})
     return rows
 
 
@@ -273,18 +270,15 @@ def fetch_trending():
 # ── 5. 社区热议 (Reddit) ────────────────────────────────
 
 def fetch_reddit():
-    """r/CryptoCurrency 热帖 — 多 User-Agent 重试"""
-    uas = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "DailyBriefing/2.0 (Newsletter Bot)",
+    """r/CryptoCurrency 热帖"""
+    urls = [
+        "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5&raw_json=1",
+        "https://old.reddit.com/r/CryptoCurrency/hot.json?limit=5&raw_json=1",
     ]
-    for ua in uas:
+    for url in urls:
         try:
-            h = {**HEADERS, "User-Agent": ua}
-            r = requests.get(
-                "https://www.reddit.com/r/CryptoCurrency/hot.json?limit=5&raw_json=1",
-                headers=h, timeout=12
-            )
+            r = requests.get(url, headers={"User-Agent": "python:DailyBriefing:v2.0 (by /u/daily_briefing)"},
+                           timeout=12)
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -462,16 +456,13 @@ def build_html(ctx):
         # 币价表
         if prices:
             h.append('<table class="coin-table"><tr><th>币种</th><th>价格</th><th>24h涨跌</th>'
-                     '<th>24h成交量</th><th>24h高/低</th></tr>')
+                     '<th>24h成交量</th></tr>')
             for r in prices:
                 cls = "up" if r["chg_24h"] >= 0 else "down"
-                hi = r.get("high", 0)
-                lo = r.get("low", 0)
                 h.append(f'<tr><td class="coin">{r["coin"]}</td>'
                          f'<td>{fmt_price(r["price"])}</td>'
                          f'<td class="{cls}">{fmt_pct(r["chg_24h"])}</td>'
-                         f'<td>{fmt_vol(r["volume"])}</td>'
-                         f'<td style="font-size:11px;color:#888">{fmt_price(hi)}/{fmt_price(lo)}</td></tr>')
+                         f'<td>{fmt_vol(r["volume"])}</td></tr>')
             h.append('</table>')
         h.append('</div>')
 
