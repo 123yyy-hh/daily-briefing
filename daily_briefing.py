@@ -205,12 +205,15 @@ def fetch_kol_tweets():
 
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(fetch_one, u): u for u in KOL_LIST}
-        for f in as_completed(futures, timeout=45):
-            try:
-                result = f.result()
-                all_tweets.extend(result)
-            except Exception:
-                pass
+        try:
+            for f in as_completed(futures, timeout=45):
+                try:
+                    result = f.result()
+                    all_tweets.extend(result)
+                except Exception:
+                    pass
+        except TimeoutError:
+            pass  # 部分 KOL 没返回，跳过
 
     # 按时间排序取最新 8 条
     flat = []
