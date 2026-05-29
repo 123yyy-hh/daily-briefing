@@ -24,8 +24,9 @@ KOL_LIST = [
 
 # Nitter 实例（多备选，自动切换）
 NITTER_INSTANCES = [
-    "https://nitter.poast.org",
     "https://nitter.net",
+    "https://nitter.1d4.us",
+    "https://nitter.catsarch.com",
     "https://nitter.privacydev.net",
 ]
 
@@ -91,59 +92,29 @@ def http_json(url, timeout=12):
 
 # ── 1. 市场数据 ────────────────────────────────────────
 
-def fetch_binance_prices():
-    """主流币价格 — 多 Binance 端点自动切换 + CoinGecko 兜底"""
-    # 尝试多个 Binance 端点
-    endpoints = [
-        "https://api.binance.com/api/v3/ticker/24hr",
-        "https://api1.binance.com/api/v3/ticker/24hr",
-        "https://api2.binance.com/api/v3/ticker/24hr",
-        "https://api3.binance.com/api/v3/ticker/24hr",
-    ]
-    tickers = None
-    for url in endpoints:
-        data = http_json(url, timeout=15)
-        if data and isinstance(data, list) and len(data) > 100:
-            tickers = data
-            break
-
-    if tickers:
-        idx = {t["symbol"]: t for t in tickers if t["symbol"].endswith("USDT")}
-        rows = []
-        for coin in COINS:
-            tkr = idx.get(f"{coin}USDT")
-            if not tkr:
-                continue
-            price = float(tkr["lastPrice"])
-            chg = float(tkr.get("priceChangePercent", 0))
-            vol = float(tkr.get("quoteVolume", 0))
-            rows.append({"coin": coin, "price": price, "chg_24h": chg,
-                         "volume": vol, "high": float(tkr["highPrice"]),
-                         "low": float(tkr["lowPrice"])})
-        if rows:
-            return rows
-
-    # CoinGecko 兜底
-    print("  Binance 全部失败，回退 CoinGecko 价格...")
+def fetch_prices():
+    """主流币价格 — CoinGecko（GH Actions 上 Binance 451被封）"""
     cg_map = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
               "SUI": "sui", "DOGE": "dogecoin", "LINK": "chainlink"}
     cg = http_json(
         f"https://api.coingecko.com/api/v3/simple/price?ids={','.join(cg_map.values())}"
-        f"&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true",
+        f"&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
+        f"&include_24hr_high_low=true",
         timeout=20
     )
-    if cg:
-        rows = []
-        for coin, cg_id in cg_map.items():
-            d = cg.get(cg_id, {})
-            if not d:
-                continue
-            rows.append({"coin": coin, "price": d.get("usd", 0),
-                         "chg_24h": d.get("usd_24h_change", 0) or 0,
-                         "volume": d.get("usd_24h_vol", 0) or 0,
-                         "high": 0, "low": 0})
-        return rows
-    return []
+    if not cg:
+        return []
+    rows = []
+    for coin, cg_id in cg_map.items():
+        d = cg.get(cg_id, {})
+        if not d:
+            continue
+        rows.append({"coin": coin, "price": d.get("usd", 0),
+                     "chg_24h": d.get("usd_24h_change", 0) or 0,
+                     "volume": d.get("usd_24h_vol", 0) or 0,
+                     "high": d.get("usd_24h_high", 0) or 0,
+                     "low": d.get("usd_24h_low", 0) or 0})
+    return rows
 
 
 def fetch_fear_greed():
@@ -171,45 +142,30 @@ def fetch_global_market():
 # ── 2. 币圈快讯 (CryptoPanic) ──────────────────────────
 
 def fetch_crypto_news():
-    """币圈快讯 — CryptoPanic + Binance 公告兜底"""
+    """币圈快讯 — CoinDesk RSS + Decrypt RSS"""
     items = []
-    # CryptoPanic
-    data = http_json(
-        "https://cryptopanic.com/api/v1/posts/?auth_token=&public=true&kind=news&limit=8",
-        timeout=15
-    )
-    if data:
-        for p in data.get("results", [])[:6]:
-            title = p.get("title", "")
-            domain = p.get("domain", "")
-            items.append({
-                "title": t(title),
-                "url": p.get("url", ""),
-                "source": p.get("source", {}).get("title", "") or domain,
-                "published": p.get("published_at", "")[:10],
-            })
-    if items:
-        return items
-
-    # 兜底: Binance 公告
-    print("  CryptoPanic 失败，回退 Binance 公告...")
-    try:
-        r = requests.get(
-            "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-            "?type=1&catalogId=48&pageNo=1&pageSize=6",
-            headers=HEADERS, timeout=15
-        )
-        if r.status_code == 200:
-            catalogs = r.json().get("data", {}).get("catalogs", [])
-            for cat in catalogs:
-                for art in cat.get("articles", [])[:6]:
-                    title = art.get("title", "")
-                    if title:
-                        items.append({"title": t(title), "url": "", "source": "Binance"})
-            return items[:6]
-    except Exception:
-        pass
-    return items
+    feeds = [
+        ("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk"),
+        ("https://decrypt.co/feed", "Decrypt"),
+    ]
+    for feed_url, feed_name in feeds:
+        try:
+            r = http_get(feed_url, timeout=15)
+            if not r:
+                continue
+            root = ET.fromstring(r.text)
+            for item in root.findall(".//item")[:4]:
+                title_el = item.find("title")
+                link_el = item.find("link")
+                title = (title_el.text or "").strip() if title_el is not None else ""
+                url = (link_el.text or "").strip() if link_el is not None else ""
+                if title and title not in {x["title"] for x in items}:
+                    items.append({"title": t(title), "url": url, "source": feed_name})
+            if items:
+                break
+        except Exception:
+            continue
+    return items[:6]
 
 
 # ── 3. X KOL 发帖 (Nitter RSS) ─────────────────────────
@@ -636,7 +592,7 @@ def main():
     print(f"[{now:%Y-%m-%d %H:%M:%S} UTC] 每日简报 v2 开始...")
 
     print("[1] 市场数据...")
-    prices = fetch_binance_prices()
+    prices = fetch_prices()
     print(f"    币价: {len(prices)}个")
     fg = fetch_fear_greed()
     gm = fetch_global_market()
